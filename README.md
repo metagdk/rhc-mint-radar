@@ -6,6 +6,12 @@ Live **ERC-721 / ERC-1155** mint tracker for [Robinhood Chain](https://robinhood
 
 **Made by [metagdk](https://x.com/metagdk)**
 
+### Live site
+
+**https://rhc-mint-radar-4949.netlify.app**
+
+Netlify admin: https://app.netlify.com/projects/rhc-mint-radar-4949
+
 ---
 
 ## Security audit (summary)
