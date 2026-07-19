@@ -1,0 +1,47 @@
+# Netlify static deploy — no backend, no secrets, no env vars required.
+# Publish directory is the browser app only.
+
+[build]
+  publish = "public"
+  # No build command needed (pure static). Keep empty for free tier simplicity.
+  command = "echo 'Static site — no build step'"
+
+# ── Security headers (applied to every response) ─────────────────────────────
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"
+    Permissions-Policy = "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Resource-Policy = "same-site"
+    # CSP: allow self + fonts + public Blockscout API + https images (NFT media / IPFS gateways)
+    Content-Security-Policy = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https: blob:; connect-src 'self' https://robinhoodchain.blockscout.com; upgrade-insecure-requests"
+    # Long cache for versioned assets is set below; HTML stays fresh
+
+[[headers]]
+  for = "/*.html"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/*.js"
+  [headers.values]
+    Cache-Control = "public, max-age=3600, must-revalidate"
+
+[[headers]]
+  for = "/*.css"
+  [headers.values]
+    Cache-Control = "public, max-age=3600, must-revalidate"
+
+# SPA-style fallback not needed (single page), but keep clean 404
+[[redirects]]
+  from = "/api/*"
+  to = "/index.html"
+  status = 404

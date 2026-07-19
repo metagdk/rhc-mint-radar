@@ -1,0 +1,15 @@
+{
+  "name": "rhc-nft-mint-tracker",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Static real-time NFT mint tracker for Robinhood Chain (Netlify-ready, no API keys)",
+  "scripts": {
+    "start": "node server.js",
+    "preview": "node server.js",
+    "serve": "npx --yes serve public -l 3847"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

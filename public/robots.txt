@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+# Static mint tracker — public blockchain data only
