@@ -1,4 +1,4 @@
-# Netlify deploy — static Mint Radar plus optional serverless private-intelligence proxy.
+# Netlify deploy — static Mint Radar plus serverless intelligence/marketplace resolvers.
 
 [build]
   publish = "public"
@@ -39,5 +39,11 @@
 [[redirects]]
   from = "/api/intel"
   to = "/.netlify/functions/intel"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/marketplace"
+  to = "/.netlify/functions/marketplace"
   status = 200
   force = true
