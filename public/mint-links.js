@@ -1,25 +1,25 @@
-/* RHC Mint Radar — real mint-location resolver.
- * Priority: explicit mint/launchpad metadata -> project site -> OpenSea collection.
- * Never falls back to Blockscout contract-write URLs.
+/* RHC Mint Radar — verified mint-location resolver.
+ * Priority: explicit mint/launchpad metadata -> verified OpenSea collection -> project site.
+ * Never uses a Blockscout write-contract URL as a mint destination.
  */
 (() => {
   "use strict";
-  if (window.__RHC_MINT_LINKS_V3__) return;
-  window.__RHC_MINT_LINKS_V3__ = true;
+  if (window.__RHC_MINT_LINKS_V4__) return;
+  window.__RHC_MINT_LINKS_V4__ = true;
 
   const EXPLORER_HOST = "robinhoodchain.blockscout.com";
   const API = `https://${EXPLORER_HOST}/api/v2`;
-  const OPEN_SEA = "https://opensea.io/collection/";
   const cache = new Map();
   const pending = new Set();
   const MAX_CONCURRENT = 3;
+  const CACHE_MS = 10 * 60 * 1000;
   const KNOWN_MINT_HOSTS = [
     "launchmynft.io", "heymint.xyz", "mint.fun", "manifold.xyz",
     "thirdweb.com", "zora.co", "highlight.xyz", "premint.xyz",
     "mintgate.io", "nftport.xyz", "foundation.app"
   ];
   const MINT_KEYS = /(^|_)(mint|minting|mintpage|mint_page|claim|claimpage|claim_page|launchpad|launch_page|drop|sale|presale|presale_page|public_sale)(_|$)/i;
-  const MINT_TEXT = /(^|[/.\\-_])(mint|minting|claim|launchpad|drop|presale|sale)([/.\\-_]|$)/i;
+  const MINT_TEXT = /(^|[/.\\-_])(mint|minting|claim|launchpad|drop|presale)([/.\\-_]|$)/i;
 
   function safeUrl(value) {
     if (typeof value !== "string" || !value.trim()) return null;
@@ -27,23 +27,22 @@
       const u = new URL(value.trim());
       if (u.protocol !== "https:" && u.protocol !== "http:") return null;
       if (u.hostname.toLowerCase() === EXPLORER_HOST) return null;
+      if (u.hostname.toLowerCase() === "opensea.io" && u.pathname.includes("write_contract")) return null;
       return u.href;
     } catch { return null; }
   }
+
   function hostOf(url) {
     try { return new URL(url).hostname.toLowerCase().replace(/^www\./, ""); } catch { return ""; }
   }
+
   function knownMintHost(url) {
     const host = hostOf(url);
     return KNOWN_MINT_HOSTS.some((d) => host === d || host.endsWith(`.${d}`));
   }
+
   function likelyMintUrl(url) {
     return !!url && (knownMintHost(url) || MINT_TEXT.test(url.toLowerCase()));
-  }
-  function normalizeCandidate(value) {
-    const url = safeUrl(value);
-    if (!url) return null;
-    return { url, confidence: likelyMintUrl(url) ? "high" : "medium" };
   }
 
   function collectionName(row) {
@@ -52,37 +51,12 @@
     return (el?.textContent || row.dataset.collectionName || "").replace(/\s+/g, " ").trim();
   }
 
-  // OpenSea uses a human-readable collection slug. There is no on-chain
-  // canonical OpenSea slug, so we generate conservative candidates from
-  // the collection name and only use this as a marketplace fallback.
-  function openSeaSlugCandidates(name) {
-    const raw = String(name || "").trim();
-    if (!raw) return [];
-    const base = raw
-      .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/&/g, " and ")
-      .replace(/[’'`]/g, "")
-      .replace(/[^a-zA-Z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .replace(/-{2,}/g, "-")
-      .toLowerCase();
-    if (!base) return [];
-    const compact = base.replace(/-/g, "");
-    return [...new Set([base, compact])].slice(0, 2);
-  }
-
-  function openSeaCandidate(name) {
-    const slug = openSeaSlugCandidates(name)[0];
-    return slug ? { url: `${OPEN_SEA}${encodeURIComponent(slug)}`, confidence: "low", source: "opensea-name" } : null;
-  }
-
   function inspectMetadata(meta) {
-    if (!meta || typeof meta !== "object") return { mint: null, site: null, openSea: null };
+    if (!meta || typeof meta !== "object") return { mint: null, site: null };
     const candidates = [];
     const push = (value, source, explicit = false) => {
-      const c = normalizeCandidate(value);
-      if (c) candidates.push({ ...c, source, explicit });
+      const url = safeUrl(value);
+      if (url) candidates.push({ url, source, explicit, confidence: likelyMintUrl(url) ? "high" : "medium" });
     };
     const keys = [
       "mint_url", "mintUrl", "mint_page", "mintPage", "mint_website", "mintWebsite", "mint_site", "mintSite",
@@ -98,16 +72,15 @@
       }
     }
     push(meta.external_app_url, "external_app_url");
-    push(meta.home_url, "home_url");
     push(meta.external_url, "external_url");
     if (meta.metadata && meta.metadata !== meta) {
       const nested = inspectMetadata(meta.metadata);
-      if (nested.mint) candidates.push({ ...nested.mint, source: `nested:${nested.mint.source}` });
-      if (nested.site) candidates.push({ ...nested.site, source: `nested:${nested.site.source}` });
+      if (nested.mint) candidates.push(nested.mint);
+      if (nested.site) candidates.push(nested.site);
     }
     return {
       mint: candidates.find((c) => c.explicit || c.confidence === "high") || null,
-      site: candidates.find((c) => c.url && !likelyMintUrl(c.url)) || null
+      site: candidates.find((c) => !likelyMintUrl(c.url)) || null
     };
   }
 
@@ -121,13 +94,7 @@
     } finally { clearTimeout(timer); }
   }
 
-  async function resolve(address, name) {
-    const key = String(address || "").toLowerCase();
-    if (!/^0x[a-f0-9]{40}$/.test(key)) return null;
-    const cached = cache.get(key);
-    if (cached && Date.now() - cached.at < 10 * 60 * 1000) return cached.data;
-    if (pending.has(key) || pending.size >= MAX_CONCURRENT) return null;
-    pending.add(key);
+  async function metadataResolve(address) {
     try {
       const data = await fetchJson(`${API}/tokens/${encodeURIComponent(address)}/instances?limit=8`);
       let mint = null, site = null;
@@ -139,20 +106,56 @@
         }
         if (mint) break;
       }
-      // If the collection is represented on OpenSea but doesn't expose a
-      // launchpad URL in metadata, its OpenSea collection page is the useful
-      // marketplace/mint destination. This is intentionally last priority.
-      const openSea = openSeaCandidate(name);
-      const result = { mint, site, openSea };
-      cache.set(key, { at: Date.now(), data: result });
-      return result;
+      return { mint, site };
     } catch {
-      // Still provide the deterministic OpenSea candidate when the explorer
-      // metadata request is temporarily unavailable.
-      const result = { mint: null, site: null, openSea: openSeaCandidate(name) };
+      return { mint: null, site: null };
+    }
+  }
+
+  async function marketplaceResolve(address, name) {
+    const params = new URLSearchParams();
+    if (address) params.set("address", address);
+    if (name) params.set("name", name);
+    try {
+      const result = await fetchJson(`/api/marketplace?${params.toString()}`);
+      return result?.found && safeUrl(result.url) ? { url: result.url, source: result.source || "opensea" } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function resolve(address, name) {
+    const key = `${String(address || "").toLowerCase()}|${String(name || "").toLowerCase()}`;
+    const cached = cache.get(key);
+    if (cached && Date.now() - cached.at < CACHE_MS) return cached.data;
+    if (pending.has(key) || pending.size >= MAX_CONCURRENT) return null;
+    pending.add(key);
+    try {
+      const metadata = await metadataResolve(address);
+      // An explicit mint/claim/launchpad URL is the highest-confidence target.
+      if (metadata.mint) {
+        const result = { ...metadata, marketplace: null };
+        cache.set(key, { at: Date.now(), data: result });
+        return result;
+      }
+
+      // Resolve the actual OpenSea collection server-side. This is not a
+      // guessed slug: the function searches OpenSea and verifies the result.
+      const marketplace = await marketplaceResolve(address, name);
+      if (marketplace) {
+        const result = { mint: null, site: metadata.site, marketplace };
+        cache.set(key, { at: Date.now(), data: result });
+        return result;
+      }
+
+      // If OpenSea does not contain the collection, a real project site is
+      // still more useful than a blockchain write-contract screen.
+      const result = { mint: null, site: metadata.site, marketplace: null };
       cache.set(key, { at: Date.now(), data: result });
       return result;
-    } finally { pending.delete(key); }
+    } finally {
+      pending.delete(key);
+    }
   }
 
   function setAnchor(anchor, url, label, disabled = false) {
@@ -173,7 +176,7 @@
     anchor.classList.remove("disabled");
     anchor.removeAttribute("aria-disabled");
     anchor.textContent = label;
-    anchor.title = label === "Mint" ? "Open detected mint / launchpad" : label === "OpenSea" ? "Open collection on OpenSea" : "Open project site";
+    anchor.title = label === "Mint" ? "Open detected mint / launchpad" : label === "OpenSea" ? "Open verified OpenSea collection" : "Open project site";
   }
 
   function addSideLink(row, url, label) {
@@ -189,7 +192,7 @@
     }
     link.href = url;
     link.textContent = label === "Mint" ? "↗ Mint" : label === "OpenSea" ? "↗ OpenSea" : "↗ Site";
-    link.title = label === "Mint" ? "Open detected mint / launchpad" : label === "OpenSea" ? "Open collection on OpenSea" : "Open project site";
+    link.title = label === "Mint" ? "Open detected mint / launchpad" : label === "OpenSea" ? "Open verified OpenSea collection" : "Open project site";
   }
 
   async function processRow(row) {
@@ -198,40 +201,44 @@
     if (!address) return;
     row.dataset.mintLocationProcessing = "1";
     const primary = row.querySelector(".cell-act a.btn.primary");
-    const result = await resolve(address, collectionName(row));
-    if (!document.contains(row)) return;
-    row.dataset.mintLocationProcessing = "0";
-    if (result === null && !cache.has(String(address).toLowerCase())) return;
+    try {
+      const result = await resolve(address, collectionName(row));
+      if (!document.contains(row)) return;
+      const mint = result?.mint?.url || null;
+      const marketplace = result?.marketplace?.url || null;
+      const site = result?.site?.url || null;
 
-    const mint = result?.mint?.url || null;
-    const site = result?.site?.url || null;
-    const openSea = result?.openSea?.url || null;
-
-    if (mint) {
-      setAnchor(primary, mint, "Mint");
-      addSideLink(row, mint, "Mint");
-    } else if (site) {
-      setAnchor(primary, site, "Site");
-      addSideLink(row, site, "Site");
-    } else if (openSea) {
-      setAnchor(primary, openSea, "OpenSea");
-      addSideLink(row, openSea, "OpenSea");
-    } else {
-      setAnchor(primary, null, "Mint unavailable", true);
-      row.querySelector(".mint-location-link")?.remove();
+      if (mint) {
+        setAnchor(primary, mint, "Mint");
+        addSideLink(row, mint, "Mint");
+      } else if (marketplace) {
+        setAnchor(primary, marketplace, "OpenSea");
+        addSideLink(row, marketplace, "OpenSea");
+      } else if (site) {
+        setAnchor(primary, site, "Site");
+        addSideLink(row, site, "Site");
+      } else {
+        setAnchor(primary, null, "Mint unavailable", true);
+        row.querySelector(".mint-location-link")?.remove();
+      }
+      row.dataset.mintLocationResolved = "1";
+    } finally {
+      row.dataset.mintLocationProcessing = "0";
     }
-    row.dataset.mintLocationResolved = "1";
   }
 
   function processFeed() {
     document.querySelectorAll("#feed .feed-item").forEach((item) => {
-      const mint = item.querySelector(".feed-links a:last-child");
-      if (mint && (mint.href || "").includes(EXPLORER_HOST) && (mint.href || "").includes("write_contract")) mint.remove();
+      const links = item.querySelectorAll(".feed-links a");
+      links.forEach((link) => {
+        const href = link.href || "";
+        if (href.includes(EXPLORER_HOST) && href.includes("write_contract")) link.remove();
+      });
     });
   }
 
-  function scan(root = document) {
-    root.querySelectorAll("#collections .rank-row[data-addr]").forEach((row) => processRow(row).catch(() => { row.dataset.mintLocationProcessing = "0"; }));
+  function scan() {
+    document.querySelectorAll("#collections .rank-row[data-addr]").forEach((row) => processRow(row).catch(() => { row.dataset.mintLocationProcessing = "0"; }));
     processFeed();
   }
 
