@@ -148,13 +148,18 @@
     link.title = label === "Mint" ? "Open detected mint / launchpad" : "Open project site";
   }
   async function processRow(row) {
-    if (!row || row.dataset.mintLocationResolved === "1") return;
+    if (!row || row.dataset.mintLocationResolved === "1" || row.dataset.mintLocationProcessing === "1") return;
     const address = row.dataset.addr;
     if (!address) return;
-    row.dataset.mintLocationResolved = "1";
+    row.dataset.mintLocationProcessing = "1";
     const primary = row.querySelector(".cell-act a.btn.primary");
     const result = await resolve(address);
     if (!document.contains(row)) return;
+    row.dataset.mintLocationProcessing = "0";
+
+    // If the concurrency guard deferred this row, let the next mutation/scan retry it.
+    if (result === null && !cache.has(String(address).toLowerCase())) return;
+
     const mint = result?.mint?.url || null;
     const site = result?.site?.url || null;
     const fallbackSite = site && !likelyMintUrl(site) ? site : null;
@@ -168,6 +173,7 @@
       setAnchor(primary, null, "Mint unavailable", true);
       row.querySelector(".mint-location-link")?.remove();
     }
+    row.dataset.mintLocationResolved = "1";
   }
   function processFeed() {
     document.querySelectorAll("#feed .feed-item").forEach((item) => {
@@ -176,7 +182,7 @@
     });
   }
   function scan(root = document) {
-    root.querySelectorAll("#collections .rank-row[data-addr]").forEach((row) => processRow(row).catch(() => {}));
+    root.querySelectorAll("#collections .rank-row[data-addr]").forEach((row) => processRow(row).catch(() => { row.dataset.mintLocationProcessing = "0"; }));
     processFeed();
   }
   function boot() {
