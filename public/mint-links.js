@@ -1,245 +1,287 @@
-/* RHC Mint Radar — verified mint-location resolver.
- * Priority: explicit mint/launchpad metadata -> verified OpenSea collection -> project site.
- * Never uses a Blockscout write-contract URL as a mint destination.
+/* RHC Mint Radar — mint destination resolver.
+ * Never allows the default Blockscout write-contract action to be used as a mint destination.
+ * Resolution order: explicit mint/launchpad -> verified marketplace -> verified project site.
+ * A click on the native Mint button is intercepted until a safe destination is resolved.
  */
 (() => {
   "use strict";
-  if (window.__RHC_MINT_LINKS_V4__) return;
-  window.__RHC_MINT_LINKS_V4__ = true;
+  if (window.__RHC_MINT_LINKS_V5__) return;
+  window.__RHC_MINT_LINKS_V5__ = true;
 
   const EXPLORER_HOST = "robinhoodchain.blockscout.com";
-  const API = `https://${EXPLORER_HOST}/api/v2`;
+  const EXPLORER = `https://${EXPLORER_HOST}`;
+  const API = `${EXPLORER}/api/v2`;
   const cache = new Map();
-  const pending = new Set();
-  const MAX_CONCURRENT = 3;
+  const pending = new Map();
   const CACHE_MS = 10 * 60 * 1000;
-  const KNOWN_MINT_HOSTS = [
-    "launchmynft.io", "heymint.xyz", "mint.fun", "manifold.xyz",
-    "thirdweb.com", "zora.co", "highlight.xyz", "premint.xyz",
-    "mintgate.io", "nftport.xyz", "foundation.app"
-  ];
-  const MINT_KEYS = /(^|_)(mint|minting|mintpage|mint_page|claim|claimpage|claim_page|launchpad|launch_page|drop|sale|presale|presale_page|public_sale)(_|$)/i;
-  const MINT_TEXT = /(^|[/.\\-_])(mint|minting|claim|launchpad|drop|presale)([/.\\-_]|$)/i;
+  const CLICK_TIMEOUT = 7000;
 
   function safeUrl(value) {
     if (typeof value !== "string" || !value.trim()) return null;
     try {
       const u = new URL(value.trim());
       if (u.protocol !== "https:" && u.protocol !== "http:") return null;
-      if (u.hostname.toLowerCase() === EXPLORER_HOST) return null;
-      if (u.hostname.toLowerCase() === "opensea.io" && u.pathname.includes("write_contract")) return null;
+      const host = u.hostname.toLowerCase();
+      const path = u.pathname.toLowerCase();
+      if (host === EXPLORER_HOST) return null;
+      if (host === "opensea.io" && path.includes("write_contract")) return null;
       return u.href;
     } catch { return null; }
   }
 
-  function hostOf(url) {
-    try { return new URL(url).hostname.toLowerCase().replace(/^www\./, ""); } catch { return ""; }
+  function isBadExplorerMint(url) {
+    try {
+      const u = new URL(url || "", window.location.href);
+      return u.hostname.toLowerCase() === EXPLORER_HOST && /write_contract/i.test(u.search + u.pathname);
+    } catch { return false; }
   }
 
-  function knownMintHost(url) {
-    const host = hostOf(url);
-    return KNOWN_MINT_HOSTS.some((d) => host === d || host.endsWith(`.${d}`));
+  function fetchJson(url, timeout = 6000) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+    return fetch(url, {
+      signal: ctrl.signal,
+      headers: { Accept: "application/json" },
+      credentials: "omit",
+      cache: "no-store",
+      referrerPolicy: "no-referrer"
+    }).then(async r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    }).finally(() => clearTimeout(timer));
   }
 
-  function likelyMintUrl(url) {
-    return !!url && (knownMintHost(url) || MINT_TEXT.test(url.toLowerCase()));
+  function rowName(row) {
+    return (row?.querySelector(".col-copy .name, .col-copy h3, .collection-name, [data-collection-name]")?.textContent || row?.dataset?.collectionName || "")
+      .replace(/\s+/g, " ").trim();
   }
 
-  function collectionName(row) {
-    if (!row) return "";
-    const el = row.querySelector(".col-copy .name, .col-copy h3, .collection-name, [data-collection-name]");
-    return (el?.textContent || row.dataset.collectionName || "").replace(/\s+/g, " ").trim();
+  function slugify(value) {
+    return String(value || "")
+      .normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+      .replace(/&/g, " and ").replace(/[’'`]/g, "")
+      .replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "")
+      .replace(/-{2,}/g, "-").toLowerCase();
   }
 
-  function inspectMetadata(meta) {
-    if (!meta || typeof meta !== "object") return { mint: null, site: null };
-    const candidates = [];
-    const push = (value, source, explicit = false) => {
-      const url = safeUrl(value);
-      if (url) candidates.push({ url, source, explicit, confidence: likelyMintUrl(url) ? "high" : "medium" });
-    };
+  function metadataCandidates(meta) {
+    if (!meta || typeof meta !== "object") return [];
+    const out = [];
     const keys = [
-      "mint_url", "mintUrl", "mint_page", "mintPage", "mint_website", "mintWebsite", "mint_site", "mintSite",
-      "claim_url", "claimUrl", "claim_page", "claimPage", "launchpad_url", "launchpadUrl", "launchpad",
-      "launch_page", "launchPage", "sale_url", "saleUrl", "presale_url", "presaleUrl", "drop_url", "dropUrl",
-      "public_sale_url", "publicSaleUrl"
+      "mint_url","mintUrl","mint_page","mintPage","mint_website","mintWebsite","mint_site","mintSite",
+      "claim_url","claimUrl","claim_page","claimPage","launchpad_url","launchpadUrl","launchpad",
+      "launch_page","launchPage","sale_url","saleUrl","presale_url","presaleUrl","drop_url","dropUrl",
+      "public_sale_url","publicSaleUrl","external_app_url","external_url","website","homepage","project_url"
     ];
-    for (const key of keys) if (meta[key]) push(meta[key], key, true);
+    for (const key of keys) {
+      const url = safeUrl(meta[key]);
+      if (url) out.push({ url, key, explicit: /mint|claim|launch|sale|drop|presale/i.test(key) });
+    }
     if (Array.isArray(meta.attributes)) {
       for (const a of meta.attributes) {
-        const key = String(a?.trait_type || a?.key || "").trim();
-        if (key && a?.value != null && MINT_KEYS.test(key)) push(String(a.value), key, true);
+        const key = String(a?.trait_type || a?.key || "");
+        const url = safeUrl(a?.value);
+        if (url && /mint|claim|launch|sale|drop|presale/i.test(key)) out.push({ url, key, explicit: true });
       }
     }
-    push(meta.external_app_url, "external_app_url");
-    push(meta.external_url, "external_url");
-    if (meta.metadata && meta.metadata !== meta) {
-      const nested = inspectMetadata(meta.metadata);
-      if (nested.mint) candidates.push(nested.mint);
-      if (nested.site) candidates.push(nested.site);
-    }
-    return {
-      mint: candidates.find((c) => c.explicit || c.confidence === "high") || null,
-      site: candidates.find((c) => !likelyMintUrl(c.url)) || null
-    };
-  }
-
-  async function fetchJson(url) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 6000);
-    try {
-      const res = await fetch(url, { signal: ctrl.signal, headers: { Accept: "application/json" }, credentials: "omit", cache: "no-store", referrerPolicy: "no-referrer" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
-    } finally { clearTimeout(timer); }
+    if (meta.metadata && meta.metadata !== meta) out.push(...metadataCandidates(meta.metadata));
+    return out;
   }
 
   async function metadataResolve(address) {
     try {
-      const data = await fetchJson(`${API}/tokens/${encodeURIComponent(address)}/instances?limit=8`);
-      let mint = null, site = null;
-      for (const item of data?.items || []) {
-        for (const meta of [item, item?.metadata]) {
-          const found = inspectMetadata(meta);
-          if (!mint && found.mint) mint = found.mint;
-          if (!site && found.site) site = found.site;
-        }
-        if (mint) break;
-      }
-      return { mint, site };
+      // Token-level data is important: external_app_url/external_url often lives here,
+      // while the instance endpoint may only expose NFT metadata.
+      const [token, instances] = await Promise.all([
+        fetchJson(`${API}/tokens/${encodeURIComponent(address)}`).catch(() => null),
+        fetchJson(`${API}/tokens/${encodeURIComponent(address)}/instances?limit=8`).catch(() => null)
+      ]);
+      const candidates = [
+        ...metadataCandidates(token?.metadata),
+        ...metadataCandidates(token),
+        ...(instances?.items || []).flatMap(item => [
+          ...metadataCandidates(item),
+          ...metadataCandidates(item?.metadata)
+        ])
+      ];
+      return {
+        mint: candidates.find(c => c.explicit) || null,
+        site: candidates.find(c => !c.explicit) || null
+      };
     } catch {
       return { mint: null, site: null };
     }
   }
 
   async function marketplaceResolve(address, name) {
-    const params = new URLSearchParams();
-    if (address) params.set("address", address);
-    if (name) params.set("name", name);
+    const qs = new URLSearchParams();
+    if (address) qs.set("address", address);
+    if (name) qs.set("name", name);
     try {
-      const result = await fetchJson(`/api/marketplace?${params.toString()}`);
-      return result?.found && safeUrl(result.url) ? { url: result.url, source: result.source || "opensea" } : null;
-    } catch {
-      return null;
-    }
+      const r = await fetchJson(`/api/marketplace?${qs.toString()}`, 6500);
+      const url = safeUrl(r?.url);
+      if (r?.found && url && !isBadExplorerMint(url)) return { url, source: r.source || "marketplace" };
+    } catch {}
+    return null;
   }
 
   async function resolve(address, name) {
     const key = `${String(address || "").toLowerCase()}|${String(name || "").toLowerCase()}`;
     const cached = cache.get(key);
     if (cached && Date.now() - cached.at < CACHE_MS) return cached.data;
-    if (pending.has(key) || pending.size >= MAX_CONCURRENT) return null;
-    pending.add(key);
-    try {
+    if (pending.has(key)) return pending.get(key);
+
+    const promise = (async () => {
       const metadata = await metadataResolve(address);
-      // An explicit mint/claim/launchpad URL is the highest-confidence target.
       if (metadata.mint) {
-        const result = { ...metadata, marketplace: null };
-        cache.set(key, { at: Date.now(), data: result });
-        return result;
+        const data = { url: metadata.mint.url, label: "Mint", source: "metadata" };
+        cache.set(key, { at: Date.now(), data });
+        return data;
       }
 
-      // Resolve the actual OpenSea collection server-side. This is not a
-      // guessed slug: the function searches OpenSea and verifies the result.
       const marketplace = await marketplaceResolve(address, name);
       if (marketplace) {
-        const result = { mint: null, site: metadata.site, marketplace };
-        cache.set(key, { at: Date.now(), data: result });
-        return result;
+        const data = { url: marketplace.url, label: "OpenSea", source: marketplace.source };
+        cache.set(key, { at: Date.now(), data });
+        return data;
       }
 
-      // If OpenSea does not contain the collection, a real project site is
-      // still more useful than a blockchain write-contract screen.
-      const result = { mint: null, site: metadata.site, marketplace: null };
-      cache.set(key, { at: Date.now(), data: result });
-      return result;
+      // Last resort: only offer a human-friendly OpenSea collection URL when a
+      // real collection name exists. This is deliberately never a Blockscout URL.
+      const slug = slugify(name);
+      if (slug) {
+        const data = { url: `https://opensea.io/collection/${encodeURIComponent(slug)}`, label: "OpenSea", source: "name-fallback" };
+        cache.set(key, { at: Date.now(), data });
+        return data;
+      }
+
+      if (metadata.site) {
+        const data = { url: metadata.site.url, label: "Site", source: "metadata" };
+        cache.set(key, { at: Date.now(), data });
+        return data;
+      }
+      const data = null;
+      cache.set(key, { at: Date.now(), data });
+      return data;
+    })();
+
+    pending.set(key, promise);
+    try { return await promise; }
+    finally { pending.delete(key); }
+  }
+
+  function getRow(target) {
+    return target?.closest?.("[data-addr], .rank-row, article");
+  }
+
+  function getMintButton(row) {
+    if (!row) return null;
+    const candidates = row.querySelectorAll("a,button");
+    for (const el of candidates) {
+      if (/^\s*mint\s*$/i.test(el.textContent || "")) return el;
+    }
+    return row.querySelector(".cell-act a.btn.primary, .cell-act button.btn.primary");
+  }
+
+  function setDestination(button, result) {
+    if (!button || !result?.url) return false;
+    const url = safeUrl(result.url);
+    if (!url || isBadExplorerMint(url)) return false;
+    if (button.tagName === "A") {
+      button.href = url;
+      button.target = "_blank";
+      button.rel = "noopener noreferrer";
+    } else {
+      button.dataset.mintUrl = url;
+    }
+    button.dataset.mintResolved = "1";
+    button.dataset.mintSource = result.source || "unknown";
+    if (result.label === "OpenSea") button.title = "Open verified/likely OpenSea collection";
+    return true;
+  }
+
+  async function resolveForRow(row) {
+    const address = row?.dataset?.addr;
+    if (!address) return null;
+    return resolve(address, rowName(row));
+  }
+
+  // Critical fix: intercept the native button before its Blockscout write-contract
+  // href can fire. This also handles a user clicking immediately after a new row appears.
+  document.addEventListener("click", async (event) => {
+    const target = event.target?.closest?.("a,button");
+    if (!target || !/^\s*mint\s*$/i.test(target.textContent || "")) return;
+    const row = getRow(target);
+    if (!row?.dataset?.addr) return;
+    const href = target.getAttribute("href") || target.href || "";
+    if (!isBadExplorerMint(href) && target.dataset.mintResolved === "1") return;
+
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (target.dataset.mintResolving === "1") return;
+    target.dataset.mintResolving = "1";
+    const original = target.textContent;
+    target.textContent = "Resolving…";
+    try {
+      const result = await Promise.race([
+        resolveForRow(row),
+        new Promise(resolve => setTimeout(() => resolve(null), CLICK_TIMEOUT))
+      ]);
+      if (result?.url && setDestination(target, result)) {
+        // Preserve the user's click intent after asynchronous resolution.
+        window.open(result.url, "_blank", "noopener,noreferrer");
+      } else {
+        target.title = "No verified mint/collection destination found";
+      }
     } finally {
-      pending.delete(key);
+      target.textContent = original;
+      target.dataset.mintResolving = "0";
     }
-  }
-
-  function setAnchor(anchor, url, label, disabled = false) {
-    if (!anchor) return;
-    if (disabled || !url) {
-      anchor.removeAttribute("href");
-      anchor.removeAttribute("target");
-      anchor.removeAttribute("rel");
-      anchor.classList.add("disabled");
-      anchor.textContent = label;
-      anchor.setAttribute("aria-disabled", "true");
-      anchor.title = "No verified mint location found";
-      return;
-    }
-    anchor.href = url;
-    anchor.target = "_blank";
-    anchor.rel = "noopener noreferrer";
-    anchor.classList.remove("disabled");
-    anchor.removeAttribute("aria-disabled");
-    anchor.textContent = label;
-    anchor.title = label === "Mint" ? "Open detected mint / launchpad" : label === "OpenSea" ? "Open verified OpenSea collection" : "Open project site";
-  }
-
-  function addSideLink(row, url, label) {
-    const copy = row.querySelector(".col-copy");
-    if (!copy || !url) return;
-    let link = copy.querySelector(".mint-location-link");
-    if (!link) {
-      link = document.createElement("a");
-      link.className = "mint-location-link";
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      (copy.querySelector(".col-meta") || copy).appendChild(link);
-    }
-    link.href = url;
-    link.textContent = label === "Mint" ? "↗ Mint" : label === "OpenSea" ? "↗ OpenSea" : "↗ Site";
-    link.title = label === "Mint" ? "Open detected mint / launchpad" : label === "OpenSea" ? "Open verified OpenSea collection" : "Open project site";
-  }
+  }, true);
 
   async function processRow(row) {
-    if (!row || row.dataset.mintLocationResolved === "1" || row.dataset.mintLocationProcessing === "1") return;
+    if (!row || row.dataset.mintLocationProcessing === "1") return;
     const address = row.dataset.addr;
     if (!address) return;
+    const button = getMintButton(row);
+    if (!button) return;
+    // Never leave the dangerous write-contract URL as an active destination.
+    if (isBadExplorerMint(button.getAttribute("href") || button.href || "")) {
+      button.removeAttribute("href");
+      button.dataset.mintPending = "1";
+    }
     row.dataset.mintLocationProcessing = "1";
-    const primary = row.querySelector(".cell-act a.btn.primary");
     try {
-      const result = await resolve(address, collectionName(row));
-      if (!document.contains(row)) return;
-      const mint = result?.mint?.url || null;
-      const marketplace = result?.marketplace?.url || null;
-      const site = result?.site?.url || null;
-
-      if (mint) {
-        setAnchor(primary, mint, "Mint");
-        addSideLink(row, mint, "Mint");
-      } else if (marketplace) {
-        setAnchor(primary, marketplace, "OpenSea");
-        addSideLink(row, marketplace, "OpenSea");
-      } else if (site) {
-        setAnchor(primary, site, "Site");
-        addSideLink(row, site, "Site");
-      } else {
-        setAnchor(primary, null, "Mint unavailable", true);
-        row.querySelector(".mint-location-link")?.remove();
+      const result = await resolveForRow(row);
+      if (!document.contains(row) || !result?.url) return;
+      setDestination(button, result);
+      let side = row.querySelector(".mint-location-link");
+      if (!side) {
+        const copy = row.querySelector(".col-copy");
+        const meta = copy?.querySelector(".col-meta") || copy;
+        if (meta) {
+          side = document.createElement("a");
+          side.className = "mint-location-link";
+          side.target = "_blank";
+          side.rel = "noopener noreferrer";
+          meta.appendChild(side);
+        }
       }
-      row.dataset.mintLocationResolved = "1";
+      if (side) {
+        side.href = result.url;
+        side.textContent = result.label === "Mint" ? "↗ Mint" : result.label === "OpenSea" ? "↗ OpenSea" : "↗ Site";
+        side.title = result.url;
+      }
     } finally {
       row.dataset.mintLocationProcessing = "0";
     }
   }
 
-  function processFeed() {
-    document.querySelectorAll("#feed .feed-item").forEach((item) => {
-      const links = item.querySelectorAll(".feed-links a");
-      links.forEach((link) => {
-        const href = link.href || "";
-        if (href.includes(EXPLORER_HOST) && href.includes("write_contract")) link.remove();
-      });
-    });
-  }
-
   function scan() {
-    document.querySelectorAll("#collections .rank-row[data-addr]").forEach((row) => processRow(row).catch(() => { row.dataset.mintLocationProcessing = "0"; }));
-    processFeed();
+    document.querySelectorAll("#collections [data-addr]").forEach(row => processRow(row).catch(() => {}));
+    document.querySelectorAll("#feed a[href]").forEach(link => {
+      if (isBadExplorerMint(link.href)) link.removeAttribute("href");
+    });
   }
 
   function boot() {
