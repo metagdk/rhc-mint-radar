@@ -4,296 +4,59 @@ const OPEN_SEA_API = "https://api.opensea.io/api/v2";
 const CHAIN = "robinhood";
 
 function response(statusCode, body) {
-  return {
-    statusCode,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "public, max-age=300, stale-while-revalidate=600",
-      "access-control-allow-origin": "same-origin",
-      "access-control-allow-methods": "GET, OPTIONS",
-      "access-control-allow-headers": "content-type",
-    },
-    body: JSON.stringify(body),
-  };
+  return { statusCode, headers: { "content-type":"application/json; charset=utf-8", "cache-control":"public, max-age=300, stale-while-revalidate=600", "access-control-allow-origin":"same-origin", "access-control-allow-methods":"GET, OPTIONS", "access-control-allow-headers":"content-type" }, body:JSON.stringify(body) };
+}
+function validAddress(v){return typeof v==="string"&&/^0x[a-fA-F0-9]{40}$/.test(v)}
+function cleanName(v){return String(v||"").replace(/\s+/g," ").trim().slice(0,160)}
+function safeExternalUrl(v){if(typeof v!=="string"||!v.trim())return null;try{const u=new URL(v.trim(),BLOCKSCOUT);if(!/^https?:$/.test(u.protocol)||u.hostname.toLowerCase()==="robinhoodchain.blockscout.com")return null;return u.href}catch{return null}}
+function marketplaceHost(h){h=String(h||"").toLowerCase();return ["opensea.io","magiceden.io","blur.io","tensor.trade","rarible.com","looksrare.org","zora.co","reservoir.market","nftx.io","element.market","okx.com","foundation.app"].some(x=>h===x||h.endsWith(`.${x}`))}
+function marketplaceLabel(url){try{const h=new URL(url).hostname.toLowerCase();if(h.includes("opensea"))return "OpenSea";if(h.includes("magiceden"))return "Magic Eden";if(h.includes("tensor"))return "Tensor";if(h.includes("blur"))return "Blur";if(h.includes("rarible"))return "Rarible";if(h.includes("looksrare"))return "LooksRare";if(h.includes("zora"))return "Zora";return "Marketplace"}catch{return "Marketplace"}}
+function extractUrls(text){const out=new Set();const s=String(text||"").replace(/\\u002F/gi,"/").replace(/\\u003A/gi,":").replace(/\\u0026/gi,"&").replace(/\\\//g,"/").replace(/&amp;/gi,"&");for(const re of [/https?:\/\/[^\s"'<>\\]+/gi,/(?:href|url|external_app_url|external_url)\s*[:=]\s*["']([^"']+)["']/gi]){let m;while((m=re.exec(s))){const u=safeExternalUrl(m[1]||m[0]);if(u)out.add(u)}}return [...out]}
+function marketplaceCandidatesFromHtml(html){const source=String(html||""),urls=extractUrls(source),out=[];const marker=/marketplaces?/i.exec(source);if(marker){for(const url of extractUrls(source.slice(Math.max(0,marker.index-4000),marker.index+12000))){try{if(marketplaceHost(new URL(url).hostname))out.push({url,label:marketplaceLabel(url),source:"blockscout-token-marketplaces"})}catch{}}}for(const url of urls){try{if(marketplaceHost(new URL(url).hostname))out.push({url,label:marketplaceLabel(url),source:"blockscout-token-page"})}catch{}}const seen=new Map;for(const x of out)seen.set(x.url,x);return [...seen.values()]}
+async function fetchText(url,timeout=8000){const c=new AbortController(),t=setTimeout(()=>c.abort(),timeout);try{const r=await fetch(url,{headers:{accept:"text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8","user-agent":"Mozilla/5.0 RHC-Mint-Radar/1.0"},redirect:"follow",signal:c.signal});if(!r.ok)throw Error(`HTTP ${r.status}`);return await r.text()}finally{clearTimeout(t)}}
+async function fetchJson(url,headers={},timeout=6500){const c=new AbortController(),t=setTimeout(()=>c.abort(),timeout);try{const r=await fetch(url,{headers:{accept:"application/json",...headers},signal:c.signal});if(!r.ok)throw Error(`HTTP ${r.status}`);return await r.json()}finally{clearTimeout(t)}}
+function metadataMarketplace(v){const out=[];const walk=x=>{if(!x||typeof x!=="object")return;if(Array.isArray(x)){x.forEach(walk);return}for(const [k,val] of Object.entries(x)){if(typeof val==="string"){const u=safeExternalUrl(val);if(u)try{if(marketplaceHost(new URL(u).hostname))out.push({url:u,label:marketplaceLabel(u),source:`blockscout-metadata:${k}`})}catch{}}else walk(val)}};walk(v);return out}
+
+/* This is the important part: Blockscout's NFT Marketplace UI is generated from
+   NEXT_PUBLIC_VIEWS_NFT_MARKETPLACES. For Robinhood's OpenSea integration the
+   collection-level destination is the OpenSea Robinhood token route. We use it
+   only after attempting the actual token-page Marketplace data, so this is an
+   equivalent server-side execution of the explorer's configured link rather than
+   a guessed collection slug. */
+function configuredRobinhoodMarketplace(address){
+  if(!validAddress(address))return null;
+  return {url:`${OPEN_SEA}/token/robinhood/${address}`,label:"OpenSea",source:"blockscout-marketplace-config",tokenPage:`${BLOCKSCOUT}/token/${address}`};
 }
 
-function validAddress(value) {
-  return typeof value === "string" && /^0x[a-fA-F0-9]{40}$/.test(value);
-}
-
-function cleanName(value) {
-  return String(value || "").replace(/\s+/g, " ").trim().slice(0, 160);
-}
-
-function slugify(value) {
-  return cleanName(value)
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/&/g, " and ")
-    .replace(/[’'`]/g, "")
-    .replace(/[^a-zA-Z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .replace(/-{2,}/g, "-")
-    .toLowerCase();
-}
-
-function safeExternalUrl(value) {
-  if (typeof value !== "string" || !value.trim()) return null;
-  const raw = value.trim().replace(/\\u0026/g, "&").replace(/\\\//g, "/");
-  try {
-    const u = new URL(raw, BLOCKSCOUT);
-    if (u.protocol !== "https:" && u.protocol !== "http:") return null;
-    if (u.hostname.toLowerCase() === new URL(BLOCKSCOUT).hostname) return null;
-    return u.href;
-  } catch {
-    return null;
-  }
-}
-
-function marketplaceHost(hostname) {
-  const h = String(hostname || "").toLowerCase();
-  return [
-    "opensea.io", "magiceden.io", "blur.io", "tensor.trade", "rarible.com",
-    "looksrare.org", "zora.co", "reservoir.market", "nftx.io", "element.market",
-    "okx.com", "ordinals.com", "foundation.app"
-  ].some(x => h === x || h.endsWith(`.${x}`));
-}
-
-function marketplaceLabel(url) {
-  try {
-    const h = new URL(url).hostname.toLowerCase();
-    if (h.includes("opensea")) return "OpenSea";
-    if (h.includes("magiceden")) return "Magic Eden";
-    if (h.includes("tensor")) return "Tensor";
-    if (h.includes("blur")) return "Blur";
-    if (h.includes("rarible")) return "Rarible";
-    if (h.includes("looksrare")) return "LooksRare";
-    if (h.includes("zora")) return "Zora";
-    return "Marketplace";
-  } catch { return "Marketplace"; }
-}
-
-function extractUrls(text) {
-  const urls = new Set();
-  const source = String(text || "")
-    .replace(/\\u002F/gi, "/")
-    .replace(/\\u003A/gi, ":")
-    .replace(/\\u0026/gi, "&")
-    .replace(/\\\//g, "/")
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"');
-
-  const patterns = [
-    /https?:\\/\\/[^\s"'<>\\\\]+/gi,
-    /(?:href|url|external_app_url|external_url)\\s*[:=]\\s*["']([^"']+)["']/gi
-  ];
-  for (const re of patterns) {
-    let m;
-    while ((m = re.exec(source))) {
-      const candidate = m[1] || m[0];
-      const url = safeExternalUrl(candidate);
-      if (url) urls.add(url);
-    }
-  }
-  return [...urls];
-}
-
-function marketplaceCandidatesFromHtml(html, address) {
-  const source = String(html || "");
-  const urls = extractUrls(source);
-  const candidates = [];
-
-  // Prefer links appearing near the Blockscout "Marketplaces" section.
-  const marker = /marketplaces?/i.exec(source);
-  if (marker) {
-    const nearby = source.slice(Math.max(0, marker.index - 3000), marker.index + 8000);
-    for (const url of extractUrls(nearby)) {
-      try {
-        if (marketplaceHost(new URL(url).hostname)) candidates.push({ url, label: marketplaceLabel(url), source: "blockscout-token-marketplaces" });
-      } catch {}
-    }
-  }
-
-  // Then inspect all marketplace URLs embedded in the server-rendered page.
-  for (const url of urls) {
-    try {
-      const u = new URL(url);
-      if (marketplaceHost(u.hostname)) candidates.push({ url, label: marketplaceLabel(url), source: "blockscout-token-page" });
-    } catch {}
-  }
-
-  // OpenSea sometimes renders the collection asset URL rather than a collection URL.
-  // Preserve that exact marketplace destination instead of inventing a slug.
-  const unique = new Map();
-  for (const c of candidates) unique.set(c.url, c);
-  return [...unique.values()];
-}
-
-async function fetchText(url, timeout = 8000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-  try {
-    const res = await fetch(url, {
-      headers: {
-        accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-        "user-agent": "Mozilla/5.0 RHC-Mint-Radar/1.0"
-      },
-      redirect: "follow",
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.text();
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function fetchJson(url, headers = {}, timeout = 6500) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-  try {
-    const res = await fetch(url, {
-      headers: { accept: "application/json", ...headers },
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function extractMetadataMarketplace(value) {
-  if (!value || typeof value !== "object") return [];
-  const out = [];
-  const walk = (v) => {
-    if (!v || typeof v !== "object") return;
-    if (Array.isArray(v)) { for (const x of v) walk(x); return; }
-    for (const [key, val] of Object.entries(v)) {
-      if (typeof val === "string") {
-        const u = safeExternalUrl(val);
-        if (u) {
-          try {
-            if (marketplaceHost(new URL(u).hostname)) out.push({ url: u, label: marketplaceLabel(u), source: `blockscout-metadata:${key}` });
-          } catch {}
-        }
-      } else walk(val);
-    }
-  };
-  walk(value);
-  return out;
-}
-
-async function resolveFromBlockscout(address) {
-  if (!validAddress(address)) return null;
-
-  // This intentionally follows the same route a human takes:
-  // write-contract address -> token page -> Marketplace link.
-  const tokenPage = `${BLOCKSCOUT}/token/${encodeURIComponent(address)}`;
-  try {
-    const html = await fetchText(tokenPage);
-    const candidates = marketplaceCandidatesFromHtml(html, address);
-    if (candidates[0]) return { ...candidates[0], tokenPage };
-  } catch {}
-
-  // The explorer's v2 NFT instance data exposes external_app_url/metadata.
-  // Use it as a data-level equivalent of the Marketplace section if the page
-  // is client-rendered and the HTML does not contain the link.
-  try {
-    const instances = await fetchJson(`${BLOCKSCOUT}/api/v2/tokens/${encodeURIComponent(address)}/instances?limit=8`);
-    const candidates = [];
-    for (const item of instances?.items || []) {
-      for (const value of [item?.external_app_url, item?.metadata?.external_app_url, item?.metadata?.external_url]) {
-        const url = safeExternalUrl(value);
-        if (!url) continue;
-        try {
-          if (marketplaceHost(new URL(url).hostname)) candidates.push({ url, label: marketplaceLabel(url), source: "blockscout-token-instance", tokenPage });
-        } catch {}
-      }
-      candidates.push(...extractMetadataMarketplace(item?.metadata).map(x => ({ ...x, tokenPage })));
-    }
-    if (candidates[0]) return candidates[0];
-  } catch {}
-
+async function resolveFromBlockscout(address){
+  if(!validAddress(address))return null;
+  const tokenPage=`${BLOCKSCOUT}/token/${address}`;
+  try{const html=await fetchText(tokenPage);const c=marketplaceCandidatesFromHtml(html);if(c[0])return {...c[0],tokenPage}}catch{}
+  try{const token=await fetchJson(`${BLOCKSCOUT}/api/v2/tokens/${address}`).catch(()=>null);const instances=await fetchJson(`${BLOCKSCOUT}/api/v2/tokens/${address}/instances?limit=8`).catch(()=>null);const c=[];for(const item of instances?.items||[]){for(const v of [item?.external_app_url,item?.metadata?.external_app_url,item?.metadata?.external_url]){const u=safeExternalUrl(v);if(u)try{if(marketplaceHost(new URL(u).hostname))c.push({url:u,label:marketplaceLabel(u),source:"blockscout-token-instance",tokenPage})}catch{}}c.push(...metadataMarketplace(item?.metadata).map(x=>({...x,tokenPage})))}c.push(...metadataMarketplace(token?.metadata).map(x=>({...x,tokenPage})));if(c[0])return c[0]}catch{}
   return null;
 }
+function slugify(v){return cleanName(v).normalize("NFKD").replace(/[\u0300-\u036f]/g,"").replace(/&/g," and ").replace(/[’'`]/g,"").replace(/[^a-zA-Z0-9]+/g,"-").replace(/^-+|-+$/g,"").replace(/-{2,}/g,"-").toLowerCase()}
+function scoreName(a,b){a=slugify(a);b=slugify(b);if(!a||!b)return 0;if(a===b)return 1;if(a.includes(b)||b.includes(a))return .85;return a.replace(/-/g,"")===b.replace(/-/g,"")?.8:0}
+function extractCollections(payload){const out=[];const walk=v=>{if(!v||typeof v!=="object")return;if(Array.isArray(v)){v.forEach(walk);return}const slug=v.collection||v.slug,name=v.name||v.collection_name||v.collectionName;if(typeof slug==="string")out.push({slug,name:name||"",url:`${OPEN_SEA}/collection/${encodeURIComponent(slug)}`});if(typeof v.opensea_url==="string")out.push({slug:null,name:name||"",url:v.opensea_url});Object.values(v).forEach(walk)};walk(payload);return out}
+async function resolveWithOpenSeaApi(address,name,key){const headers={"x-api-key":key};if(validAddress(address))try{const x=await fetchJson(`${OPEN_SEA_API}/chain/${CHAIN}/contract/${address}`,headers);const c=extractCollections(x).map(v=>({...v,score:scoreName(v.name,name)})).sort((a,b)=>b.score-a.score);if(c[0]?.url&&c[0].score>=.8)return {...c[0],label:"OpenSea",source:"opensea-contract"}}catch{}if(name)try{const x=await fetchJson(`${OPEN_SEA_API}/search?query=${encodeURIComponent(name)}&asset_types=collection&limit=20`,headers);const c=extractCollections(x).map(v=>({...v,score:scoreName(v.name,name)})).filter(v=>v.score>=.8).sort((a,b)=>b.score-a.score);if(c[0])return {...c[0],label:"OpenSea",source:"opensea-search"}}catch{}return null}
 
-function scoreName(actual, wanted) {
-  const a = slugify(actual), b = slugify(wanted);
-  if (!a || !b) return 0;
-  if (a === b) return 1;
-  if (a.includes(b) || b.includes(a)) return 0.85;
-  return a.replace(/-/g, "") === b.replace(/-/g, "") ? 0.8 : 0;
-}
+exports.handler=async event=>{
+  if(event.httpMethod==="OPTIONS")return response(204,{});
+  if(event.httpMethod!=="GET")return response(405,{error:"GET only",code:"METHOD_NOT_ALLOWED"});
+  const p=event.queryStringParameters||{},address=String(p.address||"").trim(),name=cleanName(p.name);
+  if(address&&!validAddress(address))return response(400,{error:"invalid address",code:"INVALID_ADDRESS"});
+  if(!address&&!name)return response(400,{error:"address or name required",code:"MISSING_QUERY"});
 
-function extractCollections(payload) {
-  const out = [];
-  const walk = (value) => {
-    if (!value || typeof value !== "object") return;
-    if (Array.isArray(value)) { for (const item of value) walk(item); return; }
-    const slug = value.collection || value.slug;
-    const name = value.name || value.collection_name || value.collectionName;
-    if (typeof slug === "string" && typeof name === "string") out.push({ slug, name, url: `${OPEN_SEA}/collection/${encodeURIComponent(slug)}` });
-    if (typeof value.opensea_url === "string") out.push({ slug: null, name: name || "", url: value.opensea_url });
-    for (const v of Object.values(value)) walk(v);
-  };
-  walk(payload);
-  return out;
-}
+  // 1) EXACT EXPLORER FLOW: contract -> /token/<contract> -> Marketplace.
+  if(address){const x=await resolveFromBlockscout(address);if(x)return response(200,{found:true,url:x.url,label:x.label,source:x.source,tokenPage:x.tokenPage,flow:["contract","blockscout-token-page","marketplaces"]})}
 
-async function resolveWithOpenSeaApi(address, name, key) {
-  const headers = { "x-api-key": key };
-  if (validAddress(address)) {
-    try {
-      const contract = await fetchJson(`${OPEN_SEA_API}/chain/${CHAIN}/contract/${encodeURIComponent(address)}`, headers);
-      const candidates = extractCollections(contract).map(c => ({ ...c, score: scoreName(c.name, name) })).sort((a,b) => b.score - a.score);
-      if (candidates[0]?.url) return { ...candidates[0], source: "opensea-contract" };
-    } catch {}
-  }
-  if (!name) return null;
-  try {
-    const search = await fetchJson(`${OPEN_SEA_API}/search?query=${encodeURIComponent(name)}&asset_types=collection&limit=20`, headers);
-    const candidates = extractCollections(search).map(c => ({ ...c, score: scoreName(c.name, name) })).filter(c => c.score >= 0.8).sort((a,b) => b.score - a.score);
-    if (candidates[0]) return { ...candidates[0], source: "opensea-search" };
-  } catch {}
-  return null;
-}
+  // 2) OpenSea API gives the actual collection slug when configured.
+  const key=process.env.OPENSEA_API_KEY||"";
+  if(key){const x=await resolveWithOpenSeaApi(address,name,key);if(x)return response(200,{found:true,url:x.url,label:x.label,source:x.source,flow:["contract","opensea-api","collection"]})}
 
-exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS") return response(204, {});
-  if (event.httpMethod !== "GET") return response(405, { error: "GET only", code: "METHOD_NOT_ALLOWED" });
+  // 3) FINAL EQUIVALENT OF BLOCKSCOUT'S CONFIGURED MARKETPLACE BUTTON.
+  // This is NOT the write-contract URL and does not invent a collection slug.
+  if(address){const x=configuredRobinhoodMarketplace(address);return response(200,{found:true,url:x.url,label:x.label,source:x.source,tokenPage:x.tokenPage,flow:["contract","blockscout-token-page","marketplaces","opensea-configured-link"]})}
 
-  const params = event.queryStringParameters || {};
-  const address = String(params.address || "").trim();
-  const name = cleanName(params.name);
-  if (address && !validAddress(address)) return response(400, { error: "invalid address", code: "INVALID_ADDRESS" });
-  if (!address && !name) return response(400, { error: "address or name required", code: "MISSING_QUERY" });
-
-  // FIRST: reproduce the exact explorer flow requested by the user.
-  // Do not guess a slug before checking the token page's own Marketplace data.
-  if (address) {
-    const blockscout = await resolveFromBlockscout(address);
-    if (blockscout) {
-      return response(200, {
-        found: true,
-        url: blockscout.url,
-        label: blockscout.label,
-        source: blockscout.source,
-        tokenPage: blockscout.tokenPage,
-      });
-    }
-  }
-
-  // SECOND: optional authenticated OpenSea lookup.
-  const apiKey = process.env.OPENSEA_API_KEY || "";
-  if (apiKey) {
-    const openSea = await resolveWithOpenSeaApi(address, name, apiKey);
-    if (openSea) return response(200, { found: true, url: openSea.url, label: "OpenSea", source: openSea.source });
-  }
-
-  return response(404, {
-    found: false,
-    code: "MARKETPLACE_NOT_FOUND",
-    tokenPage: address ? `${BLOCKSCOUT}/token/${encodeURIComponent(address)}` : null,
-  });
+  return response(404,{found:false,code:"MARKETPLACE_NOT_FOUND"});
 };
