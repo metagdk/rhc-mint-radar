@@ -1,10 +1,10 @@
 /* RHC Mint Radar — unified intelligence layer. */
 (() => {
   'use strict';
-  if (window.__RHC_INTEL_V3__) return;
-  window.__RHC_INTEL_V3__ = true;
+  if (window.__RHC_INTEL_V4__) return;
+  window.__RHC_INTEL_V4__ = true;
 
-  const CFG = Object.freeze({ scanMs: 5000, rpcMs: 15000, cacheMs: 5 * 60 * 1000, timeoutMs: 7000, journalKey: 'rhc-intel-journal-v2' });
+  const CFG = Object.freeze({ scanMs: 5000, rpcMs: 15000, sampleMs: 5000, cacheMs: 5 * 60 * 1000, timeoutMs: 7000, journalKey: 'rhc-intel-journal-v2' });
   const state = { cache: new Map(), journal: loadJournal(), hidden: document.hidden, lastRpc: 0, rpc: { latency:null, block:null, chainId:null, ok:false } };
 
   function loadJournal(){ try { const x=JSON.parse(localStorage.getItem(CFG.journalKey)||'[]'); return Array.isArray(x)?x:[]; } catch { return []; } }
@@ -13,7 +13,7 @@
   function txt(el,sel){ const n=el.querySelector(sel); return n?.textContent?.trim()||''; }
   function firstNumber(v){ const m=String(v??'').replace(/,/g,'').match(/-?\d+(?:\.\d+)?/); return m?Number(m[0]):null; }
   function idFor(row){ return String(row.dataset.addr||'').toLowerCase(); }
-  function rows(){ return [...document.querySelectorAll('#collections > [data-addr]')].filter(r=>idFor(r)); }
+  function rows(){ return [...document.querySelectorAll('#collections > [data-addr]')].filter(r=>/^0x[a-f0-9]{40}$/.test(idFor(r))); }
 
   function evidence(row){
     const heat = firstNumber(txt(row,'.heat-val'));
@@ -28,23 +28,21 @@
   function analyze(row){
     const id=idFor(row), now=Date.now(), ev=evidence(row), cached=state.cache.get(id);
     const samples=(cached?.samples||[]).filter(s=>now-s.t<CFG.cacheMs);
-    samples.push({t:now,m:ev.session,w:ev.windowMints});
-    const valid=samples.filter(s=>Number.isFinite(s.w));
-    let velocity=null, acceleration=null;
+    samples.push({t:now,heat:ev.heat});
+    const valid=samples.filter(s=>Number.isFinite(s.heat));
+    let velocity=ev.heat, acceleration=null;
     if(valid.length>=2){
       const a=valid[valid.length-2],b=valid[valid.length-1];
-      velocity=(b.w-a.w)/Math.max(1,(b.t-a.t)/60000);
-      if(valid.length>=3){ const p=valid[valid.length-3]; const v0=(a.w-p.w)/Math.max(1,(a.t-p.t)/60000); acceleration=velocity-v0; }
+      velocity=b.heat;
+      acceleration=(b.heat-a.heat)/Math.max(1,(b.t-a.t)/60000);
     }
     const signals=[];
-    if(ev.heat!=null) signals.push({v:Math.max(0,Math.min(100,ev.heat)),w:.55});
-    if(velocity!=null) signals.push({v:Math.max(0,Math.min(100,velocity*2)),w:.30});
-    if(acceleration!=null) signals.push({v:Math.max(0,Math.min(100,50+acceleration*2)),w:.15});
-    const weight=signals.reduce((s,x)=>s+x.w,0), alpha=weight?Math.round(signals.reduce((s,x)=>s+x.v*x.w,0)/weight):null;
-    const confidence=Math.round((signals.length/3)*100);
-    const concentration=ev.holders!=null&&ev.session!=null&&ev.holders>0?Math.min(100,(ev.session/ev.holders)*100):null;
-    const risk=[]; if(concentration!=null&&concentration>80) risk.push('high mint concentration');
-    const out={...ev,velocity,acceleration,alpha,confidence,concentration,risk,samples};
+    if(ev.heat!=null) signals.push({v:Math.max(0,Math.min(100,ev.heat)),w:.70});
+    if(acceleration!=null) signals.push({v:Math.max(0,Math.min(100,50+acceleration*2)),w:.30});
+    const weight=signals.reduce((s,x)=>s+x.w,0);
+    const alpha=weight?Math.round(signals.reduce((s,x)=>s+x.v*x.w,0)/weight):null;
+    const confidence=Math.round((signals.length/2)*100);
+    const out={...ev,velocity,acceleration,alpha,confidence,samples};
     state.cache.set(id,{at:now,...out,samples});
     return out;
   }
@@ -94,7 +92,8 @@
   function boot(){
     mount();
     document.addEventListener('visibilitychange',()=>{state.hidden=document.hidden;});
-    new MutationObserver(()=>{ if(!state.hidden) tick().catch(()=>{}); }).observe(document.getElementById('collections')||document.body,{childList:true,subtree:true});
+    const target=document.getElementById('collections');
+    if(target) new MutationObserver(()=>{ if(!state.hidden) tick().catch(()=>{}); }).observe(target,{childList:true,subtree:true});
     loop();
   }
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',boot,{once:true}); else boot();
